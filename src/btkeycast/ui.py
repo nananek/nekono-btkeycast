@@ -1,26 +1,28 @@
 """Layer-shell popup that captures all keyboard input while visible.
 
-The window uses wlr-layer-shell keyboard-mode EXCLUSIVE, so the compositor
-routes every key event here (compositor keybindings still win, the pointer is
-untouched). No evdev grabbing, no extra privileges.
-"""
+The window uses wlr-layer-shell keyboard-mode EXCLUSIVE, so while it is
+mapped the compositor routes every key event here (compositor keybindings
+still win, the pointer is untouched). No evdev grabbing, no privileges.
 
-import signal
+The popup is created once and shown/hidden by the daemon; hiding it returns
+the keyboard to local use without touching the BLE connection.
+"""
 
 import gi
 
 gi.require_version('Gdk', '3.0')
 gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
-from gi.repository import Gdk, GLib, Gtk, GtkLayerShell  # noqa: E402
+from gi.repository import Gdk, Gtk, GtkLayerShell  # noqa: E402
 
 from . import KBD_NAME  # noqa: E402
 
 CSS = b'''
 window { background-color: rgba(40, 42, 54, 0.97); }
-#title { color: #f8f8f2; font-size: 15px; font-weight: bold; }
+#title { color: #f8f8f2; font-size: 14px; font-weight: bold; }
 #status { color: #f1fa8c; font-size: 13px; }
 window.ready #status { color: #50fa7b; }
+window.disabled #status { color: #6272a4; }
 window.error #status { color: #ff5555; }
 #hint { color: #6272a4; font-size: 11px; }
 button { background: #44475a; color: #f8f8f2; border: none;
@@ -30,8 +32,13 @@ button:hover { background: #6272a4; }
 
 
 class Popup:
-    def __init__(self, core):
-        self.core = core
+    """Capture window. Calls daemon callbacks for the two buttons."""
+
+    def __init__(self, on_close, on_disconnect, on_key, on_key_release):
+        self.on_close = on_close
+        self.on_disconnect = on_disconnect
+        self.on_key = on_key
+        self.on_key_release = on_key_release
         self.pressed = set()
 
         provider = Gtk.CssProvider()
@@ -46,70 +53,70 @@ class Popup:
         GtkLayerShell.set_keyboard_mode(
             self.win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
         GtkLayerShell.set_anchor(self.win, GtkLayerShell.Edge.TOP, True)
-        GtkLayerShell.set_margin(self.win, GtkLayerShell.Edge.TOP, 60)
+        GtkLayerShell.set_anchor(self.win, GtkLayerShell.Edge.RIGHT, True)
+        GtkLayerShell.set_margin(self.win, GtkLayerShell.Edge.TOP, 6)
+        GtkLayerShell.set_margin(self.win, GtkLayerShell.Edge.RIGHT, 6)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_property('margin', 16)
-        title = Gtk.Label(label=f'⌨ {KBD_NAME} (BLE HID 転送)')
+        box.set_property('margin', 14)
+        title = Gtk.Label(label=f'⌨ {KBD_NAME}')
         title.set_name('title')
         self.status = Gtk.Label(label='初期化中…')
         self.status.set_name('status')
         self.status.set_line_wrap(True)
-        self.status.set_max_width_chars(48)
+        self.status.set_max_width_chars(44)
         hint = Gtk.Label(
             label='このポップアップが出ている間、キー入力は転送先へ送られます\n'
-                  '(コンポジタのキーバインドはローカル優先 / マウスは通常どおり)')
+                  '閉じても BLE 接続は維持 (切断はバーの右クリック or 下のボタン)')
         hint.set_name('hint')
         hint.set_justify(Gtk.Justification.CENTER)
-        close = Gtk.Button(label='切断して閉じる')
-        close.connect('clicked', lambda *_: Gtk.main_quit())
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btns.set_halign(Gtk.Align.CENTER)
+        close = Gtk.Button(label='閉じる (転送停止)')
+        close.connect('clicked', lambda *_: self.on_close())
+        disconnect = Gtk.Button(label='切断')
+        disconnect.connect('clicked', lambda *_: self.on_disconnect())
+        btns.pack_start(close, False, False, 0)
+        btns.pack_start(disconnect, False, False, 0)
         box.pack_start(title, False, False, 0)
         box.pack_start(self.status, False, False, 0)
         box.pack_start(hint, False, False, 0)
-        box.pack_start(close, False, False, 0)
+        box.pack_start(btns, False, False, 0)
         self.win.add(box)
 
-        self.win.connect('key-press-event', self.on_press)
-        self.win.connect('key-release-event', self.on_release)
-        self.win.connect('delete-event', lambda *_: Gtk.main_quit())
-        core.on_state = self.set_state
+        self.win.connect('key-press-event', self._press)
+        self.win.connect('key-release-event', self._release)
+        self.win.connect(
+            'delete-event', lambda *_: (self.on_close(), True)[1])
+
+    def show(self):
         self.win.show_all()
 
-    def set_state(self, state, detail=None):
+    def hide(self):
+        self.pressed.clear()
+        self.win.hide()
+
+    @property
+    def visible(self):
+        return self.win.get_visible()
+
+    def set_status(self, text, css_class=None):
         ctx = self.win.get_style_context()
-        for c in ('ready', 'error'):
+        for c in ('ready', 'error', 'disabled'):
             ctx.remove_class(c)
-        if state == 'advertising':
-            text = (f'BLE 広告中 — 転送先の 設定 > Bluetooth で'
-                    f'「{KBD_NAME}」を選択してください')
-        elif state == 'connected':
-            text = f'{detail} に接続 — ペアリング/購読待ち…'
-        elif state == 'ready':
-            ctx.add_class('ready')
-            text = f'転送中 → {detail}'
-        else:
-            ctx.add_class('error')
-            text = detail or 'エラー'
+        if css_class:
+            ctx.add_class(css_class)
         self.status.set_text(text)
 
-    def on_press(self, _w, event):
+    def _press(self, _w, event):
         code = event.hardware_keycode - 8
         if code not in self.pressed:        # drop GDK autorepeat
             self.pressed.add(code)
-            self.core.press(code)
+            self.on_key(code)
         return True
 
-    def on_release(self, _w, event):
+    def _release(self, _w, event):
         code = event.hardware_keycode - 8
         self.pressed.discard(code)
-        self.core.release(code)
+        self.on_key_release(code)
         return True
-
-
-def run_ui(core):
-    """Show the popup and run the main loop until closed or signalled."""
-    Popup(core)
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig,
-                             lambda: (Gtk.main_quit(), False)[1])
-    Gtk.main()

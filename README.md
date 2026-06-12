@@ -3,10 +3,16 @@
 Forward the local keyboard to an iPad (or any BLE central) as a Bluetooth LE
 HID keyboard — the same mechanism a Magic Keyboard uses.
 
-A status-bar click opens a small overlay popup; while the popup is visible,
-every key you type is translated to HID input reports and notified to the
-connected central. Close the popup and the keyboard is local again (and the
-central regains its on-screen keyboard, since the peripheral disconnects).
+A persistent daemon (hosted as a waybar continuous-exec module) keeps the
+BLE connection alive. Left-clicking the bar icon toggles a small overlay
+popup below the bar's right edge; while it is visible, every key you type is
+translated to HID input reports and notified to the connected central.
+Closing the popup returns the keyboard to local use without dropping the
+connection, so there is no reconnect delay the next time.
+
+Note that the central hides its on-screen keyboard while a hardware keyboard
+is connected — right-click the bar icon to disconnect (and reconnect) when
+you want to use the device directly.
 
 ## How it works
 
@@ -52,29 +58,33 @@ PYTHONPATH=src python -m btkeycast run
 ## Usage
 
 ```bash
-btkeycast            # run in the foreground (popup opens immediately)
-btkeycast toggle     # start detached, or stop the running instance
-btkeycast status     # waybar custom-module JSON ({"text": ..., "class": "on"|"off"})
+btkeycast daemon     # run the persistent daemon (what waybar execs)
+btkeycast toggle     # show/hide the capture popup; spawns the daemon if absent
+btkeycast conn       # toggle the BLE connection (release / re-advertise)
 ```
 
+The daemon prints a waybar JSON line on every state change
+(`kbd OFF` / `kbd ...` advertising / `kbd UP` connected / `kbd→pad`
+forwarding) and is controlled via signals (SIGUSR1 = popup, SIGUSR2 =
+connection), which is what `toggle` / `conn` send.
+
 First time: open the popup, then on the iPad go to Settings > Bluetooth and
-select the advertised name (`<hostname>-kbd`). Subsequent opens reconnect
-automatically.
+select the advertised name (`<hostname>-kbd`). Reconnects are automatic
+afterwards.
 
 Waybar wiring:
 
 ```jsonc
 "custom/btkeycast": {
     "return-type": "json",
-    "interval": "once",
-    "signal": 8,
-    "exec": "btkeycast status",
+    "exec": "btkeycast daemon",
     "exec-if": "which btkeycast",
-    "on-click": "btkeycast toggle"
+    "on-click": "btkeycast toggle",
+    "on-click-right": "btkeycast conn"
 }
 ```
 
-The running instance refreshes the module with `SIGRTMIN+8` on start/stop.
+Style classes emitted: `off`, `adv`, `up`, `on`, `error`.
 
 ## Configuration
 

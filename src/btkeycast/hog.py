@@ -78,11 +78,16 @@ class Characteristic(dbus.service.Object):
     @dbus.service.method(GATT_CHR_IFACE, in_signature='a{sv}',
                          out_signature='ay')
     def ReadValue(self, options):
+        self.on_access(options)
         return dbus.Array(self.value, signature='y')
 
     @dbus.service.method(GATT_CHR_IFACE, in_signature='aya{sv}')
     def WriteValue(self, value, options):
+        self.on_access(options)
         self.value = list(value)
+
+    def on_access(self, options):
+        pass
 
     @dbus.service.method(GATT_CHR_IFACE)
     def StartNotify(self):
@@ -210,14 +215,20 @@ class Agent(dbus.service.Object):
 class Core:
     """Owns the adapter, the GATT app and the keyboard state machine.
 
-    States reported through on_state(state, detail):
-      advertising -> connected -> ready (central subscribed to input report)
+    Exposes raw state as attributes (error / adv_registered / device_path /
+    device_name / subscribed) and fires on_change() whenever any of it moves.
+    The advertisement can be toggled at runtime with adv_on()/adv_off() —
+    adv_off() + Disconnect releases the central so it stops treating us as an
+    attached keyboard.
     """
 
     def __init__(self):
         DBusGMainLoop(set_as_default=True)
         self.bus = dbus.SystemBus()
-        self.on_state = lambda *a: None
+        self.on_change = lambda: None
+        self.error = None
+        self.adv_registered = False
+        self.subscribed = False
         om = dbus.Interface(self.bus.get_object(BLUEZ, '/'), OM_IFACE)
         objs = om.GetManagedObjects()
         adapters = sorted(str(p) for p, i in objs.items()
@@ -238,6 +249,8 @@ class Core:
             self.bus.get_object(BLUEZ, self.adapter_path), PROP_IFACE)
         self.device_path = None
         self.device_name = None
+        self.app_registered = False
+        self.want_adv = True
         self.mods = 0
         self.keys = []
         self.orig_alias = str(self.adapter.Get(ADAPTER_IFACE, 'Alias'))
@@ -286,6 +299,8 @@ class Core:
                        [0x11, 0x01, 0x00, 0x02])
         Characteristic(self.bus, 5, uuid16(0x2A4C),
                        ['write-without-response'], hid)
+        for c in hid.characteristics:
+            c.on_access = self._seen_device
         self.app.services.append(hid)
 
         bas = Service(self.bus, 1, uuid16(0x180F))
@@ -301,6 +316,10 @@ class Core:
                        [ord(c) for c in 'btkeycast'])
         self.app.services.append(dis)
 
+        self.adv = Advertisement(self.bus)
+        self.adv_mgr = dbus.Interface(
+            self.bus.get_object(BLUEZ, self.adapter_path), ADV_MGR_IFACE)
+
         gm = dbus.Interface(self.bus.get_object(BLUEZ, self.adapter_path),
                             GATT_MGR_IFACE)
         gm.RegisterApplication(
@@ -312,19 +331,46 @@ class Core:
             self._dev_changed, dbus_interface=PROP_IFACE,
             signal_name='PropertiesChanged', arg0=DEVICE_IFACE,
             path_keyword='path')
+        self._resolve_device()
 
     def _app_registered(self):
-        self.adv = Advertisement(self.bus)
-        am = dbus.Interface(self.bus.get_object(BLUEZ, self.adapter_path),
-                            ADV_MGR_IFACE)
-        am.RegisterAdvertisement(
-            ADV_PATH, {},
-            reply_handler=lambda: self.on_state('advertising'),
+        self.app_registered = True
+        if self.want_adv:
+            self.adv_on()
+
+    def adv_on(self):
+        self.want_adv = True
+        if not self.app_registered or self.adv_registered:
+            return
+
+        def ok():
+            self.adv_registered = True
+            self.on_change()
+
+        self.adv_mgr.RegisterAdvertisement(
+            ADV_PATH, {}, reply_handler=ok,
             error_handler=lambda e: self.fail(f'LE advertising failed: {e}'))
+
+    def adv_off(self):
+        self.want_adv = False
+        if self.adv_registered:
+            self.adv_registered = False
+            try:
+                self.adv_mgr.UnregisterAdvertisement(ADV_PATH)
+            except dbus.exceptions.DBusException:
+                pass
+        if self.device_path:
+            try:
+                dbus.Interface(self.bus.get_object(BLUEZ, self.device_path),
+                               DEVICE_IFACE).Disconnect()
+            except dbus.exceptions.DBusException:
+                pass
+        self.on_change()
 
     def fail(self, msg):
         print(msg, file=sys.stderr, flush=True)
-        self.on_state('error', msg)
+        self.error = msg
+        self.on_change()
 
     # ---- connection tracking
 
@@ -348,17 +394,44 @@ class Core:
                 self.device_name = str(props.Get(DEVICE_IFACE, 'Name'))
             except dbus.exceptions.DBusException:
                 self.device_name = str(props.Get(DEVICE_IFACE, 'Address'))
-            self.on_state('connected', self.device_name)
+            self.on_change()
         elif path == self.device_path:
             self.device_path = None
+            self.subscribed = False
             self.mods, self.keys = 0, []
-            self.on_state('advertising')
+            self.on_change()
+
+    def _seen_device(self, options):
+        """A central touched our HID service — that is who we forward to."""
+        path = str(options.get('device', ''))
+        if path and path != self.device_path:
+            self.device_path = path
+            props = dbus.Interface(
+                self.bus.get_object(BLUEZ, path), PROP_IFACE)
+            try:
+                self.device_name = str(props.Get(DEVICE_IFACE, 'Name'))
+            except dbus.exceptions.DBusException:
+                self.device_name = str(props.Get(DEVICE_IFACE, 'Address'))
+            self.on_change()
+
+    def _resolve_device(self):
+        """Fallback: find an already-connected LE central (random address)."""
+        om = dbus.Interface(self.bus.get_object(BLUEZ, '/'), OM_IFACE)
+        for path, ifaces in om.GetManagedObjects().items():
+            dev = ifaces.get(DEVICE_IFACE)
+            if (dev and str(path).startswith(self.adapter_path + '/')
+                    and dev.get('Connected')
+                    and dev.get('AddressType') == 'random'):
+                self.device_path = str(path)
+                self.device_name = str(dev.get('Name') or dev.get('Address'))
+                self.on_change()
+                return
 
     def notify_changed(self, enabled):
-        if enabled:
-            self.on_state('ready', self.device_name)
-        elif self.device_path:
-            self.on_state('connected', self.device_name)
+        self.subscribed = enabled
+        if enabled and not self.device_path:
+            self._resolve_device()
+        self.on_change()
 
     # ---- key handling (evdev keycodes)
 
@@ -380,6 +453,10 @@ class Core:
             self.mods &= ~(1 << (usage - 0xE0))
         elif usage in self.keys:
             self.keys.remove(usage)
+        self.send()
+
+    def release_all(self):
+        self.mods, self.keys = 0, []
         self.send()
 
     def send(self):

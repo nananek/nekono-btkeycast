@@ -1,17 +1,19 @@
-"""Command line entry point: run / toggle / status.
+"""Command line entry point.
 
-`toggle` is meant to be wired to a status bar click, `status` to a waybar
-custom module (JSON output, refreshed via RTMIN+WAYBAR_SIGNAL).
+  daemon   run the persistent daemon (waybar continuous-exec module)
+  toggle   show/hide the capture popup (left click); starts the daemon
+           detached if none is running
+  conn     toggle the BLE connection (right click)
 """
 
-import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import time
 
-from . import KBD_NAME, PROG, WAYBAR_SIGNAL
+from . import PROG
 
 
 def pidfile():
@@ -31,74 +33,50 @@ def running_pid():
     return None
 
 
-def signal_waybar():
-    subprocess.run(['pkill', f'-RTMIN+{WAYBAR_SIGNAL}', '-x', 'waybar'],
-                   check=False)
-
-
 def notify(message):
     if shutil.which('notify-send'):
         subprocess.run(['notify-send', '-u', 'critical', PROG, message],
                        check=False)
 
 
-def cmd_status():
-    if running_pid():
-        out = {'text': 'kbd→pad', 'class': 'on',
-               'tooltip': f'BLE キーボード転送中 ({KBD_NAME}) — クリックで停止'}
-    else:
-        out = {'text': 'kbd', 'class': 'off',
-               'tooltip': 'クリックで BLE キーボード転送を開始'}
-    print(json.dumps(out, ensure_ascii=False))
-
-
-def cmd_toggle():
-    pid = running_pid()
-    if pid:
-        os.kill(pid, signal.SIGTERM)
-        return
+def spawn_daemon():
     logdir = os.path.expanduser('~/.cache')
     os.makedirs(logdir, exist_ok=True)
     log = open(os.path.join(logdir, PROG + '.log'), 'ab', buffering=0)
-    subprocess.Popen([sys.executable, '-m', 'btkeycast', 'run'],
+    subprocess.Popen([sys.executable, '-m', 'btkeycast', 'daemon'],
                      stdout=log, stderr=log, start_new_session=True)
+    for _ in range(30):
+        time.sleep(0.1)
+        pid = running_pid()
+        if pid:
+            return pid
+    return None
 
 
-def cmd_run():
+def cmd_toggle():
+    pid = running_pid() or spawn_daemon()
+    if not pid:
+        notify('daemon を起動できませんでした (~/.cache/btkeycast.log 参照)')
+        raise SystemExit(1)
+    os.kill(pid, signal.SIGUSR1)
+
+
+def cmd_conn():
     pid = running_pid()
-    if pid and pid != os.getpid():
-        raise SystemExit('already running')
-
-    from .hog import Core
-    from .ui import run_ui
-
-    try:
-        core = Core()
-        core.start()
-    except SystemExit as e:
-        notify(str(e))
-        raise
-    with open(pidfile(), 'w') as f:
-        f.write(str(os.getpid()))
-    try:
-        signal_waybar()
-        run_ui(core)
-    finally:
-        core.stop()
-        try:
-            os.unlink(pidfile())
-        except OSError:
-            pass
-        signal_waybar()
+    if not pid:
+        notify('daemon が動いていません (waybar の custom/btkeycast 経由で起動します)')
+        raise SystemExit(1)
+    os.kill(pid, signal.SIGUSR2)
 
 
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else 'run'
-    if cmd == 'status':
-        cmd_status()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'daemon'
+    if cmd == 'daemon':
+        from .daemon import run
+        run()
     elif cmd == 'toggle':
         cmd_toggle()
-    elif cmd == 'run':
-        cmd_run()
+    elif cmd == 'conn':
+        cmd_conn()
     else:
-        raise SystemExit(f'usage: {PROG} [run|toggle|status]')
+        raise SystemExit(f'usage: {PROG} [daemon|toggle|conn]')

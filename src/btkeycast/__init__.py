@@ -5,5 +5,4 @@ import socket as _socket
 __version__ = '0.1.0'
 
 PROG = 'btkeycast'
-WAYBAR_SIGNAL = 8  # waybar custom module side: "signal": 8
 KBD_NAME = _socket.gethostname().split('.')[0] + '-kbd'
