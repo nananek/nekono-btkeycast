@@ -1,6 +1,6 @@
 [project]
 name = "btkeycast"
-version = "0.2.0"
+version = "0.2.1"
 description = "Forward the local keyboard to an iPad (or any BLE central) as a HID-over-GATT keyboard"
 readme = "README.md"
 license = { text = "MIT" }

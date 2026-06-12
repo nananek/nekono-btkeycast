@@ -10,23 +10,69 @@ Control is signal based:
   SIGTERM  clean shutdown (waybar restart, etc.)
 
 waybar spawns the exec once per output, so startup goes through
-acquire_instance_lock(): exactly one instance survives, siblings exit
-silently (their bar simply shows no widget).
+acquire_instance_lock(): exactly one instance becomes the primary, the
+siblings turn into followers that mirror the primary's bar line from a
+state file onto their own output's bar (and promote themselves if the
+primary dies).
 """
 
 import json
 import os
 import signal
+import time
 
 from . import KBD_NAME, PROG, config
 from .capture import Capture, have_input_access, list_keyboards
-from .cli import acquire_instance_lock, notify
+from .cli import acquire_instance_lock, notify, pidfile, statefile
+
+
+def _write_state(line):
+    """Publish the current bar line for follower instances."""
+    tmp = f'{statefile()}.{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            f.write(line + '\n')
+        os.replace(tmp, statefile())
+    except OSError:
+        pass
+
+
+def _follow():
+    """Mirror the primary's bar line onto this output's bar.
+
+    Returns when the instance lock looks free (= primary died) so the
+    caller can retry becoming the primary.
+    """
+    import fcntl
+    last = None
+    while True:
+        try:
+            with open(pidfile(), 'a+') as fd:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return
+        except OSError:
+            pass
+        try:
+            with open(statefile()) as f:
+                line = f.read().strip()
+        except OSError:
+            line = ''
+        if line and line != last:
+            try:
+                print(line, flush=True)
+            except OSError:
+                raise SystemExit(0)     # waybar が消えた — ミラー先が無い
+            last = line
+        time.sleep(0.5)
 
 
 def run():
-    lock = acquire_instance_lock()
-    if lock is None:
-        return       # 同じ waybar の別出力ぶん — 本体は既に居る
+    while True:
+        lock = acquire_instance_lock()
+        if lock is not None:
+            break
+        _follow()    # 同じ waybar の別出力ぶん — primary をミラーする
 
     import gi
     gi.require_version('Gdk', '3.0')
@@ -103,6 +149,7 @@ def run():
             if line != self.last_line:
                 self.last_line = line
                 print(line, flush=True)
+                _write_state(line)
 
             popup_text = {
                 'error': (self.core.error or 'エラー', 'error'),
@@ -204,6 +251,7 @@ def run():
         except OSError:
             pass
         # waybar側にOFF表示を残す (継続execが死んだ場合は最後の行が残るため)
-        print(json.dumps({'text': 'kbd OFF', 'class': 'off',
-                          'tooltip': f'{PROG} 停止中'}, ensure_ascii=False),
-              flush=True)
+        off = json.dumps({'text': 'kbd OFF', 'class': 'off',
+                          'tooltip': f'{PROG} 停止中'}, ensure_ascii=False)
+        print(off, flush=True)
+        _write_state(off)

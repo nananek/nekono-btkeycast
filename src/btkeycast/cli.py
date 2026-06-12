@@ -22,6 +22,11 @@ def pidfile():
     return os.path.join(runtime, PROG + '.pid')
 
 
+def statefile():
+    runtime = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
+    return os.path.join(runtime, PROG + '.state')
+
+
 def _ppid(pid):
     try:
         with open(f'/proc/{pid}/stat') as f:
