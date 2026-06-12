@@ -24,6 +24,13 @@ you want to use the device directly.
   (gtk-layer-shell). While the popup is mapped the compositor routes all key
   events to it, so no evdev grabbing or `input` group membership is needed.
   Compositor keybindings keep working locally; the pointer is untouched.
+- **Optional per-keyboard forwarding**: pin specific keyboards in the popup
+  and only those are forwarded (EVIOCGRAB — their events never reach the
+  compositor) while every other keyboard keeps working locally. Needs
+  python-evdev and read access to `/dev/input` (`input` group).
+- **Forward-target pinning**: pick one of the paired centrals in the popup;
+  any other central that tries to use the keyboard service is disconnected.
+  Selections persist in `~/.config/btkeycast/config.json`.
 - The HID service requires encryption (`encrypt-read`), which makes iOS pair
   automatically on first connect (Just Works); the device is then marked
   trusted for instant reconnects.
@@ -38,6 +45,7 @@ Wayland compositor with wlr-layer-shell (sway, etc.) and, as system packages:
 - gtk3
 - gtk-layer-shell
 - bluez (running `bluetoothd`)
+- python-evdev (optional — per-keyboard forwarding)
 
 No pip dependencies.
 
@@ -52,7 +60,7 @@ pacman -S nekono-btkeycast
 From a checkout, no installation needed:
 
 ```bash
-PYTHONPATH=src python -m btkeycast run
+PYTHONPATH=src python -m btkeycast daemon
 ```
 
 ## Usage
@@ -91,6 +99,10 @@ Style classes emitted: `off`, `adv`, `up`, `on`, `error`.
 - `BTKEYCAST_ADAPTER` — Bluetooth adapter to use (e.g. `hci1`). Default:
   the first powered adapter. HOGP coexists with classic BT on one adapter,
   so picking your main adapter is fine.
+- `~/.config/btkeycast/config.json` — written by the popup controls:
+  `target` (BT address of the pinned central, `null` = first to connect)
+  and `keyboards` (ids of pinned keyboards, `[]` = capture everything via
+  the popup).
 
 ## Notes
 
@@ -98,6 +110,9 @@ Style classes emitted: `off`, `adv`, `up`, `on`, `error`.
 - JIS keys (ろ, ¥, 変換, 無変換, カタカナひらがな, 半角/全角) are mapped to
   their USB HID international usages.
 - Logs from detached instances go to `~/.cache/btkeycast.log`.
+- waybar starts one exec per output on multi-monitor setups; the daemon
+  flocks a pidfile so exactly one instance survives (the other bars show
+  no widget).
 
 ## License
 

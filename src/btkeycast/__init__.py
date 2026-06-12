@@ -2,7 +2,7 @@
 
 import socket as _socket
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 PROG = 'btkeycast'
 KBD_NAME = _socket.gethostname().split('.')[0] + '-kbd'

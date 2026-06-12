@@ -8,20 +8,25 @@ Control is signal based:
   SIGUSR2  toggle the BLE connection (right click) — releasing it lets the
            iPad show its on-screen keyboard again
   SIGTERM  clean shutdown (waybar restart, etc.)
+
+waybar spawns the exec once per output, so startup goes through
+acquire_instance_lock(): exactly one instance survives, siblings exit
+silently (their bar simply shows no widget).
 """
 
 import json
 import os
 import signal
 
-from . import KBD_NAME, PROG
-from .cli import notify, pidfile, running_pid
+from . import KBD_NAME, PROG, config
+from .capture import Capture, have_input_access, list_keyboards
+from .cli import acquire_instance_lock, notify
 
 
 def run():
-    old = running_pid()
-    if old and old != os.getpid():
-        os.kill(old, signal.SIGTERM)
+    lock = acquire_instance_lock()
+    if lock is None:
+        return       # 同じ waybar の別出力ぶん — 本体は既に居る
 
     import gi
     gi.require_version('Gdk', '3.0')
@@ -38,15 +43,23 @@ def run():
         notify(str(e))
         raise
 
+    cfg = config.load()
+    core.target = cfg['target']
+
     class Daemon:
         def __init__(self):
             self.core = core
+            self.cfg = cfg
             self.conn_enabled = True
             self.last_line = None
+            self.capture = Capture(on_key=core.press,
+                                   on_key_release=core.release)
             self.popup = Popup(on_close=self.hide_popup,
                                on_disconnect=self.disconnect,
                                on_key=core.press,
-                               on_key_release=core.release)
+                               on_key_release=core.release,
+                               on_target=self.set_target,
+                               on_keyboards=self.set_keyboards)
             core.on_change = self.refresh
 
         # ---- state -> display
@@ -111,14 +124,37 @@ def run():
             else:
                 if not self.conn_enabled:
                     self.set_connection(True)
+                self.popup.populate(centrals=self.core.paired_centrals(),
+                                    target=self.cfg['target'],
+                                    keyboards=list_keyboards(),
+                                    selected=self.cfg['keyboards'],
+                                    access=have_input_access())
+                self._apply_capture()
                 self.popup.show()
                 self.refresh()
             return True
 
         def hide_popup(self):
+            self.capture.stop()
             self.core.release_all()
             self.popup.hide()
             self.refresh()
+
+        def _apply_capture(self):
+            grabbed = self.capture.start(self.cfg['keyboards'])
+            self.popup.set_grab_mode(grabbed > 0)
+
+        def set_target(self, address):
+            self.cfg['target'] = address
+            config.save(self.cfg)
+            self.core.set_target(address)
+
+        def set_keyboards(self, ids):
+            self.cfg['keyboards'] = ids
+            config.save(self.cfg)
+            if self.popup.visible:
+                self._apply_capture()
+                self.refresh()
 
         def toggle_connection(self):
             self.set_connection(not self.conn_enabled)
@@ -129,6 +165,7 @@ def run():
             if enabled:
                 self.core.adv_on()
             else:
+                self.capture.stop()
                 self.core.release_all()
                 self.core.adv_off()
             self.refresh()
@@ -142,8 +179,6 @@ def run():
             return False
 
     daemon = Daemon()
-    with open(pidfile(), 'w') as f:
-        f.write(str(os.getpid()))
     try:
         try:
             core.start()
@@ -159,9 +194,13 @@ def run():
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, daemon.quit)
         Gtk.main()
     finally:
+        daemon.capture.stop()
         core.stop()
         try:
-            os.unlink(pidfile())
+            # ロックは死ぬまで保持、中身だけ空に (unlink すると flock 待ちの
+            # 兄弟と新規 open の間で inode が割れて二重起動し得る)
+            lock.seek(0)
+            lock.truncate()
         except OSError:
             pass
         # waybar側にOFF表示を残す (継続execが死んだ場合は最後の行が残るため)

@@ -229,6 +229,8 @@ class Core:
         self.error = None
         self.adv_registered = False
         self.subscribed = False
+        self.target = None           # BT address; None = first central wins
+        self._addr_cache = {}
         om = dbus.Interface(self.bus.get_object(BLUEZ, '/'), OM_IFACE)
         objs = om.GetManagedObjects()
         adapters = sorted(str(p) for p, i in objs.items()
@@ -374,6 +376,53 @@ class Core:
 
     # ---- connection tracking
 
+    def addr_of(self, path):
+        if path not in self._addr_cache:
+            try:
+                self._addr_cache[path] = str(dbus.Interface(
+                    self.bus.get_object(BLUEZ, path), PROP_IFACE
+                ).Get(DEVICE_IFACE, 'Address'))
+            except dbus.exceptions.DBusException:
+                return None
+        return self._addr_cache[path]
+
+    def _disconnect_path(self, path):
+        try:
+            dbus.Interface(self.bus.get_object(BLUEZ, path),
+                           DEVICE_IFACE).Disconnect()
+        except dbus.exceptions.DBusException:
+            pass
+
+    def paired_centrals(self):
+        """[(address, name, connected)] of devices bonded to our adapter."""
+        om = dbus.Interface(self.bus.get_object(BLUEZ, '/'), OM_IFACE)
+        out = []
+        for path, ifaces in om.GetManagedObjects().items():
+            dev = ifaces.get(DEVICE_IFACE)
+            if (dev and str(path).startswith(self.adapter_path + '/')
+                    and dev.get('Paired')):
+                out.append((str(dev['Address']),
+                            str(dev.get('Name') or dev['Address']),
+                            bool(dev.get('Connected'))))
+        return sorted(out, key=lambda d: d[1])
+
+    def set_target(self, address):
+        """Pin the central we forward to; kick a mismatched current one."""
+        self.target = address
+        if (address and self.device_path
+                and self.addr_of(self.device_path) != address):
+            self._disconnect_path(self.device_path)
+        self.on_change()
+
+    def _adopt(self, path):
+        self.device_path = path
+        props = dbus.Interface(self.bus.get_object(BLUEZ, path), PROP_IFACE)
+        try:
+            self.device_name = str(props.Get(DEVICE_IFACE, 'Name'))
+        except dbus.exceptions.DBusException:
+            self.device_name = str(props.Get(DEVICE_IFACE, 'Address'))
+        self.on_change()
+
     def _dev_changed(self, iface, changed, invalidated, path=None):
         if not path or not path.startswith(self.adapter_path + '/'):
             return
@@ -387,14 +436,9 @@ class Core:
         if 'Connected' not in changed:
             return
         if changed['Connected']:
-            self.device_path = path
-            props = dbus.Interface(
-                self.bus.get_object(BLUEZ, path), PROP_IFACE)
-            try:
-                self.device_name = str(props.Get(DEVICE_IFACE, 'Name'))
-            except dbus.exceptions.DBusException:
-                self.device_name = str(props.Get(DEVICE_IFACE, 'Address'))
-            self.on_change()
+            if self.target and self.addr_of(path) != self.target:
+                return       # 関係ない機器 (ローカルの BT 周辺機器等) は放置
+            self._adopt(path)
         elif path == self.device_path:
             self.device_path = None
             self.subscribed = False
@@ -404,26 +448,29 @@ class Core:
     def _seen_device(self, options):
         """A central touched our HID service — that is who we forward to."""
         path = str(options.get('device', ''))
-        if path and path != self.device_path:
-            self.device_path = path
-            props = dbus.Interface(
-                self.bus.get_object(BLUEZ, path), PROP_IFACE)
-            try:
-                self.device_name = str(props.Get(DEVICE_IFACE, 'Name'))
-            except dbus.exceptions.DBusException:
-                self.device_name = str(props.Get(DEVICE_IFACE, 'Address'))
-            self.on_change()
+        if not path:
+            return
+        if self.target and self.addr_of(path) != self.target:
+            # target 以外の central がキーボードとして使おうとした — 蹴る
+            self._disconnect_path(path)
+            return
+        if path != self.device_path:
+            self._adopt(path)
 
     def _resolve_device(self):
-        """Fallback: find an already-connected LE central (random address)."""
+        """Fallback: find the connected central we should forward to."""
         om = dbus.Interface(self.bus.get_object(BLUEZ, '/'), OM_IFACE)
         for path, ifaces in om.GetManagedObjects().items():
             dev = ifaces.get(DEVICE_IFACE)
-            if (dev and str(path).startswith(self.adapter_path + '/')
-                    and dev.get('Connected')
+            if not (dev and str(path).startswith(self.adapter_path + '/')
+                    and dev.get('Connected')):
+                continue
+            addr = str(dev.get('Address'))
+            if (self.target and addr == self.target) or (
+                    not self.target
                     and dev.get('AddressType') == 'random'):
                 self.device_path = str(path)
-                self.device_name = str(dev.get('Name') or dev.get('Address'))
+                self.device_name = str(dev.get('Name') or addr)
                 self.on_change()
                 return
 

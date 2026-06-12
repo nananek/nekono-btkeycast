@@ -6,6 +6,7 @@
   conn     toggle the BLE connection (right click)
 """
 
+import fcntl
 import os
 import shutil
 import signal
@@ -19,6 +20,61 @@ from . import PROG
 def pidfile():
     runtime = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
     return os.path.join(runtime, PROG + '.pid')
+
+
+def _ppid(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return int(f.read().rsplit(')', 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def acquire_instance_lock():
+    """Single-instance gate via flock on the pidfile.
+
+    waybar はマルチモニタだと custom module の exec を出力ごとに 1 個ずつ
+    起動するので、daemon は出力数ぶん同時に立ち上がる。先に flock を取れた
+    1 個だけが本体になる。負けた側は、ロック保持者が同じ親 (= 同じ waybar)
+    の兄弟なら黙って身を引き (None を返す)、前世代の残骸なら SIGTERM して
+    引き継ぐ。
+
+    Returns the fd holding the lock (keep it open for the daemon's
+    lifetime; the lock dies with the process), or None when a sibling
+    already runs.
+    """
+    fd = open(pidfile(), 'a+')
+    deadline = time.time() + 5
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = running_pid()
+            if holder and holder != os.getpid():
+                if _ppid(holder) == os.getppid():
+                    fd.close()
+                    return None
+                try:
+                    os.kill(holder, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if time.time() > deadline:
+                fd.close()
+                raise SystemExit('another instance refuses to exit')
+            time.sleep(0.1)
+            continue
+        # flock を持たない旧版 daemon が残っていたら引き継ぐ (移行経路)
+        legacy = running_pid()
+        if legacy and legacy != os.getpid():
+            try:
+                os.kill(legacy, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        fd.seek(0)
+        fd.truncate()
+        fd.write(str(os.getpid()))
+        fd.flush()
+        return fd
 
 
 def running_pid():
